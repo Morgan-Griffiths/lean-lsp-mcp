@@ -668,9 +668,7 @@ def _to_diagnostic_messages(diagnostics: Iterable[Dict]) -> List[DiagnosticMessa
     """Convert LSP diagnostics to DiagnosticMessage models."""
     result = []
     for diag in diagnostics:
-        r = diag.get("fullRange", diag.get("range"))
-        if r is None:
-            continue
+        line, column = _diagnostic_position(diag)
         severity_int = diag.get("severity", 1)
         result.append(
             DiagnosticMessage(
@@ -678,11 +676,20 @@ def _to_diagnostic_messages(diagnostics: Iterable[Dict]) -> List[DiagnosticMessa
                     severity_int, f"unknown({severity_int})"
                 ),
                 message=diag.get("message", ""),
-                line=r["start"]["line"] + 1,
-                column=r["start"]["character"] + 1,
+                line=line,
+                column=column,
             )
         )
     return result
+
+
+def _diagnostic_position(diagnostic: Dict) -> tuple[int, int]:
+    """Return a 1-indexed position, defaulting global diagnostics to file start."""
+    diagnostic_range = diagnostic.get("fullRange", diagnostic.get("range"))
+    if diagnostic_range is None:
+        return 1, 1
+    start = diagnostic_range["start"]
+    return start["line"] + 1, start["character"] + 1
 
 
 def _process_diagnostics(
@@ -702,14 +709,9 @@ def _process_diagnostics(
     failed_deps: List[str] = []
 
     for diag in diagnostics:
-        r = diag.get("fullRange", diag.get("range"))
-        if r is None:
-            continue
-
         severity_int = diag.get("severity", 1)
         message = diag.get("message", "")
-        line = r["start"]["line"] + 1
-        column = r["start"]["character"] + 1
+        line, column = _diagnostic_position(diag)
 
         # Check if this is a build failure at (1,1) - extract dependency paths, skip the item
         if line == 1 and column == 1 and is_build_stderr(message):

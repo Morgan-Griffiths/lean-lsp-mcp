@@ -816,6 +816,32 @@ def test_process_diagnostics_build_failure_excluded_regardless_of_filter() -> No
     assert result.success is False
 
 
+def test_process_diagnostics_preserves_unlocated_fatal_errors() -> None:
+    """Global Lean failures without an LSP range must not disappear."""
+    result = server._process_diagnostics(
+        [{"message": "leanclient: Received LeanFileProgressKind.fatalError."}],
+        build_success=False,
+    )
+
+    assert len(result.items) == 1
+    assert result.items[0].severity == "error"
+    assert result.items[0].line == 1
+    assert result.items[0].column == 1
+    assert "fatalError" in result.items[0].message
+
+
+def test_to_diagnostic_messages_preserves_unlocated_errors() -> None:
+    diagnostics = server._to_diagnostic_messages(
+        [{"message": "global Lean server failure"}]
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].severity == "error"
+    assert diagnostics[0].line == 1
+    assert diagnostics[0].column == 1
+    assert diagnostics[0].message == "global Lean server failure"
+
+
 def test_process_diagnostics_accepts_plain_string_severity() -> None:
     """The tool now passes severity as a plain string (Literal), not an enum.
 
