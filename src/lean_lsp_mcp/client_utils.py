@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from threading import Lock
 
@@ -103,7 +104,44 @@ def get_path_policy(ctx: Context, project_path: Path | None = None) -> LeanPathP
     root = project_path or getattr(lifespan, "lean_project_path", None)
     if root is None:
         raise ValueError("lean project path is not set.")
-    return build_lean_path_policy(root, config.extra_roots())
+    return build_lean_path_policy(root, _effective_extra_roots(ctx))
+
+
+def _effective_module_root(ctx: Context) -> Path | None:
+    lifespan = ctx.request_context.lifespan_context
+    if lifespan.external_roots_configured:
+        return lifespan.external_module_root
+    return config.module_root()
+
+
+def _effective_extra_roots(ctx: Context) -> tuple[Path, ...]:
+    lifespan = ctx.request_context.lifespan_context
+    if not lifespan.external_roots_configured:
+        return config.extra_roots()
+
+    roots: list[Path] = []
+    if lifespan.external_module_root is not None:
+        roots.append(lifespan.external_module_root)
+    for root in lifespan.external_extra_roots:
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def _effective_server_arguments(ctx: Context) -> tuple[str, ...]:
+    if module_root := _effective_module_root(ctx):
+        return (f"--root={module_root}",)
+    return ()
+
+
+def _effective_server_env(ctx: Context) -> dict[str, str]:
+    roots = _effective_extra_roots(ctx)
+    if not roots:
+        return {}
+    components = [str(root) for root in roots]
+    if configured := os.environ.get("LEAN_PATH", ""):
+        components.append(configured)
+    return {"LEAN_PATH": os.pathsep.join(components)}
 
 
 def _start_client(
@@ -143,11 +181,13 @@ def _evict_oldest_client() -> None:
     _close_client(old, f"Evicted shared client for {oldest_key}")
 
 
-def _get_or_create_shared_client(lean_project_path: Path) -> LeanLSPClient:
+def _get_or_create_shared_client(
+    lean_project_path: Path, ctx: Context
+) -> LeanLSPClient:
     project_key = lean_project_path.resolve(strict=False)
     server_options = config.server_options()
-    server_arguments = config.server_arguments()
-    server_env = config.server_env()
+    server_arguments = _effective_server_arguments(ctx)
+    server_env = _effective_server_env(ctx)
 
     if project_key in _builds_in_progress:
         raise ValueError(
@@ -220,7 +260,7 @@ def startup_client(ctx: Context):
         if configured_root is None:
             raise ValueError("lean project path is not set.")
         lean_project_path = bind_lean_project_path(ctx, configured_root)
-        client = _get_or_create_shared_client(lean_project_path)
+        client = _get_or_create_shared_client(lean_project_path, ctx)
         ctx.request_context.lifespan_context.client = client
 
 
@@ -286,7 +326,7 @@ def infer_project_path(file_path: str, ctx: Context | None = None) -> Path | Non
     if ctx and lifespan.lean_project_path:
         try:
             current_policy = build_lean_path_policy(
-                lifespan.lean_project_path, config.extra_roots()
+                lifespan.lean_project_path, _effective_extra_roots(ctx)
             )
         except ValueError:
             current_policy = None
@@ -305,7 +345,7 @@ def infer_project_path(file_path: str, ctx: Context | None = None) -> Path | Non
             if cached_root:
                 try:
                     cached_policy = build_lean_path_policy(
-                        Path(cached_root), config.extra_roots()
+                        Path(cached_root), _effective_extra_roots(ctx)
                     )
                 except ValueError:
                     lifespan.project_cache[current_dir_str] = ""
@@ -342,7 +382,7 @@ def setup_client_for_file(ctx: Context, file_path: str) -> str | None:
         return None
 
     try:
-        policy = build_lean_path_policy(project_path, config.extra_roots())
+        policy = build_lean_path_policy(project_path, _effective_extra_roots(ctx))
     except ValueError:
         return None
     if not policy.contains(resolved_file):

@@ -69,6 +69,9 @@ class _LifespanContext:
         self.client = client
         self.active_transport = active_transport
         self.project_switching_allowed = project_switching_allowed
+        self.external_roots_configured = False
+        self.external_module_root: Path | None = None
+        self.external_extra_roots: tuple[Path, ...] = ()
         self.file_content_hashes: dict[str, int] = {}
         self.project_cache: dict[str, Path | str] = {}
 
@@ -192,6 +195,24 @@ def test_setup_client_for_external_module_root(
     theory_file.write_text("theorem external : True := by trivial\n")
     monkeypatch.setenv("LEAN_LSP_MODULE_ROOT", str(theory_root))
     ctx = _Context(_LifespanContext(project, None))
+
+    assert setup_client_for_file(ctx, str(theory_file)) == theory_file.as_posix()
+    assert patched_clients[0].server_arguments == (f"--root={theory_root}",)
+    assert patched_clients[0].server_env == {"LEAN_PATH": str(theory_root)}
+
+
+def test_setup_client_for_session_external_module_root(
+    tmp_path: Path, patched_clients: list[_MockLeanClient]
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    theory_root = tmp_path / "theory"
+    theory_file = theory_root / "Support" / "Example.lean"
+    theory_file.parent.mkdir(parents=True)
+    theory_file.write_text("theorem external : True := by trivial\n")
+    lifespan = _LifespanContext(project, None)
+    lifespan.external_roots_configured = True
+    lifespan.external_module_root = theory_root
+    ctx = _Context(lifespan)
 
     assert setup_client_for_file(ctx, str(theory_file)) == theory_file.as_posix()
     assert patched_clients[0].server_arguments == (f"--root={theory_root}",)

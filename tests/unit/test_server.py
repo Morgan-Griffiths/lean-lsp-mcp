@@ -75,6 +75,47 @@ def _make_project(root: Path) -> Path:
     return root
 
 
+def test_set_project_context_binds_external_roots(tmp_path: Path) -> None:
+    project = _make_project(tmp_path / "proj")
+    module_root = tmp_path / "theory"
+    module_root.mkdir()
+    generated_root = tmp_path / "generated"
+    generated_root.mkdir()
+    ctx = _make_ctx()
+
+    result = server.set_project_context(
+        ctx,
+        str(project),
+        str(module_root),
+        [str(generated_root), str(module_root)],
+    )
+
+    lifespan = ctx.request_context.lifespan_context
+    assert result == {
+        "lean_project_path": str(project.resolve()),
+        "module_root": str(module_root.resolve()),
+        "extra_roots": [str(generated_root.resolve())],
+    }
+    assert lifespan.lean_project_path == project.resolve()
+    assert lifespan.external_roots_configured is True
+    assert lifespan.external_module_root == module_root.resolve()
+    assert lifespan.external_extra_roots == (generated_root.resolve(),)
+
+
+def test_set_project_context_rejects_roots_before_binding_project(
+    tmp_path: Path,
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    ctx = _make_ctx()
+
+    with pytest.raises(server.LeanToolError, match="module_root"):
+        server.set_project_context(ctx, str(project), str(tmp_path / "missing"))
+
+    lifespan = ctx.request_context.lifespan_context
+    assert lifespan.lean_project_path is None
+    assert lifespan.external_roots_configured is False
+
+
 def _make_dependency(project: Path, dep_root: Path) -> Path:
     dep_file = dep_root / "Mathlib" / "Foo.lean"
     dep_file.parent.mkdir(parents=True)

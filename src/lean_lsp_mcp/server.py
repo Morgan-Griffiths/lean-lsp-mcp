@@ -301,6 +301,9 @@ class AppContext:
     client: LeanLSPClient | None
     rate_limit: Dict[str, List[int]]
     lean_search_available: bool
+    external_roots_configured: bool = False
+    external_module_root: Path | None = None
+    external_extra_roots: tuple[Path, ...] = ()
     active_transport: str = "stdio"
     project_switching_allowed: bool = True
     loogle_manager: LoogleManager | None = None
@@ -1194,6 +1197,7 @@ import sys as _sys  # noqa: E402
 
 TOOL_MODULES = (
     "build",
+    "context",
     "diagnostics",
     "goals",
     "navigation",
@@ -1208,6 +1212,7 @@ for _name in TOOL_MODULES:
     _tool_modules[_name] = _importlib.import_module(_qualified)
 
 lsp_build = _tool_modules["build"].lsp_build
+set_project_context = _tool_modules["context"].set_project_context
 file_outline = _tool_modules["diagnostics"].file_outline
 diagnostic_messages = _tool_modules["diagnostics"].diagnostic_messages
 code_actions = _tool_modules["diagnostics"].code_actions

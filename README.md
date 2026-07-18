@@ -270,6 +270,12 @@ files, just as they do for a direct Lean invocation. Put the corresponding
 generated `.olean` root in `LEAN_LSP_EXTRA_ROOTS` before the source root,
 or build the external modules into a stable search root first.
 
+For stdio clients that need to switch between unrelated external trees in one
+session, call `lean_set_project_context` before the first file-based tool.
+It binds the Lake project that supplies imports plus the external
+`module_root` and optional generated `.olean` roots without restarting the
+MCP process.
+
 You can also often set these environment variables in your MCP client configuration:
 <details>
 <summary><b>VSCode mcp.json Example</b></summary>
