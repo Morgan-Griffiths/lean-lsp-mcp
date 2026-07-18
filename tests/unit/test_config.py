@@ -1,5 +1,7 @@
 """Tests for the centralized config module."""
 
+import os
+
 import pytest
 
 from lean_lsp_mcp import config
@@ -23,6 +25,63 @@ def test_max_open_files(monkeypatch: pytest.MonkeyPatch):
     assert config.max_open_files() == 4
     monkeypatch.setenv(config.MAX_OPEN_FILES_ENV, "0")
     assert config.max_open_files() == 4
+
+
+def test_server_options(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(config.SERVER_OPTIONS_ENV, raising=False)
+    assert config.server_options() == {}
+
+    monkeypatch.setenv(
+        config.SERVER_OPTIONS_ENV,
+        '{"weak.linter.style.header":false,"maxHeartbeats":400000,"trace.Meta.Tactic.simp.rewrite":"true"}',
+    )
+    assert config.server_options() == {
+        "weak.linter.style.header": False,
+        "maxHeartbeats": 400000,
+        "trace.Meta.Tactic.simp.rewrite": "true",
+    }
+
+
+@pytest.mark.parametrize(
+    "value,match",
+    [
+        ("not-json", "must be a JSON object"),
+        ("[]", "must be a JSON object"),
+        ('{"bad name":true}', "option names"),
+        ('{"bad=name":true}', "option names"),
+        ('{"maxHeartbeats":1.5}', "boolean, integer, or string"),
+    ],
+)
+def test_server_options_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, value: str, match: str
+):
+    monkeypatch.setenv(config.SERVER_OPTIONS_ENV, value)
+    with pytest.raises(ValueError, match=match):
+        config.server_options()
+
+
+def test_external_module_roots(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    module_root = tmp_path / "theory"
+    extra_root = tmp_path / "generated"
+    module_root.mkdir()
+    extra_root.mkdir()
+    monkeypatch.setenv(config.MODULE_ROOT_ENV, str(module_root))
+    monkeypatch.setenv(config.EXTRA_ROOTS_ENV, f'["{extra_root}"]')
+    monkeypatch.setenv("LEAN_PATH", "/existing/path")
+
+    assert config.module_root() == module_root
+    assert config.extra_roots() == (module_root, extra_root)
+    assert config.server_arguments() == (f"--root={module_root}",)
+    assert config.server_env() == {
+        "LEAN_PATH": f"{module_root}{os.pathsep}{extra_root}{os.pathsep}/existing/path"
+    }
+
+
+@pytest.mark.parametrize("value", ["not-json", "{}", "[1]", '[""]', '["   "]'])
+def test_extra_roots_reject_invalid_values(monkeypatch: pytest.MonkeyPatch, value: str):
+    monkeypatch.setenv(config.EXTRA_ROOTS_ENV, value)
+    with pytest.raises(ValueError, match="JSON array"):
+        config.extra_roots()
 
 
 def test_build_concurrency(monkeypatch: pytest.MonkeyPatch):

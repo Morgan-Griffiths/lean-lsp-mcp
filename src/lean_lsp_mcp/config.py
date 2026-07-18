@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
+
+import orjson
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +20,9 @@ logger = logging.getLogger(__name__)
 # --- Environment variable names (single source of truth) ---
 ACTIVE_TRANSPORT_ENV = "LEAN_LSP_MCP_ACTIVE_TRANSPORT"
 MAX_OPEN_FILES_ENV = "LEAN_LSP_MAX_OPEN_FILES"
+SERVER_OPTIONS_ENV = "LEAN_LSP_SERVER_OPTIONS"
+MODULE_ROOT_ENV = "LEAN_LSP_MODULE_ROOT"
+EXTRA_ROOTS_ENV = "LEAN_LSP_EXTRA_ROOTS"
 TEST_MODE_ENV = "LEAN_LSP_TEST_MODE"
 PROJECT_PATH_ENV = "LEAN_PROJECT_PATH"
 AUTH_TOKEN_ENV = "LEAN_LSP_MCP_TOKEN"
@@ -73,6 +79,96 @@ def max_open_files() -> int:
         logger.warning("Invalid %s=%s, defaulting to 4.", MAX_OPEN_FILES_ENV, raw_value)
         return 4
     return value
+
+
+def server_options() -> dict[str, bool | int | str]:
+    """Return client-wide Lean server options from a JSON environment value."""
+    raw_value = os.environ.get(SERVER_OPTIONS_ENV, "").strip()
+    if not raw_value:
+        return {}
+
+    try:
+        parsed = orjson.loads(raw_value)
+    except orjson.JSONDecodeError as exc:
+        raise ValueError(f"{SERVER_OPTIONS_ENV} must be a JSON object: {exc}") from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{SERVER_OPTIONS_ENV} must be a JSON object.")
+
+    options: dict[str, bool | int | str] = {}
+    for name, value in parsed.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or any(character.isspace() for character in name)
+            or "=" in name
+        ):
+            raise ValueError(
+                f"{SERVER_OPTIONS_ENV} option names must be non-empty strings "
+                "without whitespace or '='."
+            )
+        if not isinstance(value, (bool, int, str)):
+            raise ValueError(
+                f"{SERVER_OPTIONS_ENV} option '{name}' must have a boolean, "
+                "integer, or string value."
+            )
+        options[name] = value
+    return options
+
+
+def module_root() -> Path | None:
+    """Return the optional external Lean module root passed to `lake serve`."""
+    raw_value = os.environ.get(MODULE_ROOT_ENV, "").strip()
+    if not raw_value:
+        return None
+    root = Path(raw_value).expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError(f"{MODULE_ROOT_ENV} must name a directory.")
+    return root
+
+
+def extra_roots() -> tuple[Path, ...]:
+    """Return external source/search roots allowed by the path policy."""
+    raw_value = os.environ.get(EXTRA_ROOTS_ENV, "").strip()
+    roots: list[Path] = []
+    if raw_value:
+        try:
+            parsed = orjson.loads(raw_value)
+        except orjson.JSONDecodeError as exc:
+            raise ValueError(f"{EXTRA_ROOTS_ENV} must be a JSON array: {exc}") from exc
+        if not isinstance(parsed, list) or not all(
+            isinstance(value, str) and value.strip() for value in parsed
+        ):
+            raise ValueError(f"{EXTRA_ROOTS_ENV} must be a JSON array of paths.")
+        roots.extend(Path(value).expanduser().resolve(strict=True) for value in parsed)
+    if configured_module_root := module_root():
+        roots.insert(0, configured_module_root)
+    unique_roots: list[Path] = []
+    for root in roots:
+        if not root.is_dir():
+            raise ValueError(f"{EXTRA_ROOTS_ENV} paths must name directories.")
+        if root not in unique_roots:
+            unique_roots.append(root)
+    return tuple(unique_roots)
+
+
+def server_arguments() -> tuple[str, ...]:
+    """Return Lean server arguments implied by the configured module root."""
+    if configured_module_root := module_root():
+        return (f"--root={configured_module_root}",)
+    return ()
+
+
+def server_env() -> dict[str, str]:
+    """Return Lean server environment additions for external module lookup."""
+    roots = extra_roots()
+    if not roots:
+        return {}
+    configured = os.environ.get("LEAN_PATH", "")
+    components = [str(root) for root in roots]
+    if configured:
+        components.append(configured)
+    return {"LEAN_PATH": os.pathsep.join(components)}
 
 
 # --- Build / logging ---

@@ -103,10 +103,15 @@ def get_path_policy(ctx: Context, project_path: Path | None = None) -> LeanPathP
     root = project_path or getattr(lifespan, "lean_project_path", None)
     if root is None:
         raise ValueError("lean project path is not set.")
-    return build_lean_path_policy(root)
+    return build_lean_path_policy(root, config.extra_roots())
 
 
-def _start_client(project_path: Path) -> LeanLSPClient:
+def _start_client(
+    project_path: Path,
+    server_options: dict[str, bool | int | str],
+    server_arguments: tuple[str, ...],
+    server_env: dict[str, str],
+) -> LeanLSPClient:
     prevent_cache = config.test_mode()
     try:
         with OutputCapture() as output:
@@ -115,6 +120,9 @@ def _start_client(project_path: Path) -> LeanLSPClient:
                 initial_build=False,
                 prevent_cache_get=prevent_cache,
                 max_opened_files=_max_opened_files(),
+                server_options=server_options,
+                server_arguments=server_arguments,
+                server_env=server_env,
             )
             logger.info("Shared LSP client connected at %s", project_path)
         build_output = output.get_output()
@@ -137,6 +145,9 @@ def _evict_oldest_client() -> None:
 
 def _get_or_create_shared_client(lean_project_path: Path) -> LeanLSPClient:
     project_key = lean_project_path.resolve(strict=False)
+    server_options = config.server_options()
+    server_arguments = config.server_arguments()
+    server_env = config.server_env()
 
     if project_key in _builds_in_progress:
         raise ValueError(
@@ -144,7 +155,13 @@ def _get_or_create_shared_client(lean_project_path: Path) -> LeanLSPClient:
         )
 
     client = _shared_clients.get(project_key)
-    if client is not None and _client_is_alive(client):
+    if (
+        client is not None
+        and _client_is_alive(client)
+        and getattr(client, "server_options", None) == server_options
+        and getattr(client, "server_arguments", None) == server_arguments
+        and getattr(client, "server_env", None) == server_env
+    ):
         return client
 
     if client is not None:
@@ -154,7 +171,7 @@ def _get_or_create_shared_client(lean_project_path: Path) -> LeanLSPClient:
     if len(_shared_clients) >= _MAX_SHARED_CLIENTS:
         _evict_oldest_client()
 
-    client = _start_client(project_key)
+    client = _start_client(project_key, server_options, server_arguments, server_env)
     _shared_clients[project_key] = client
     return client
 
@@ -268,7 +285,9 @@ def infer_project_path(file_path: str, ctx: Context | None = None) -> Path | Non
 
     if ctx and lifespan.lean_project_path:
         try:
-            current_policy = build_lean_path_policy(lifespan.lean_project_path)
+            current_policy = build_lean_path_policy(
+                lifespan.lean_project_path, config.extra_roots()
+            )
         except ValueError:
             current_policy = None
         if current_policy is not None and current_policy.contains(resolved_input):
@@ -285,7 +304,9 @@ def infer_project_path(file_path: str, ctx: Context | None = None) -> Path | Non
             cached_root = lifespan.project_cache.get(current_dir_str)
             if cached_root:
                 try:
-                    cached_policy = build_lean_path_policy(Path(cached_root))
+                    cached_policy = build_lean_path_policy(
+                        Path(cached_root), config.extra_roots()
+                    )
                 except ValueError:
                     lifespan.project_cache[current_dir_str] = ""
                 else:
@@ -321,7 +342,7 @@ def setup_client_for_file(ctx: Context, file_path: str) -> str | None:
         return None
 
     try:
-        policy = build_lean_path_policy(project_path)
+        policy = build_lean_path_policy(project_path, config.extra_roots())
     except ValueError:
         return None
     if not policy.contains(resolved_file):

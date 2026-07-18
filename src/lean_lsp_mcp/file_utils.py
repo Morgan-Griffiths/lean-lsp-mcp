@@ -16,6 +16,7 @@ _STDLIB_DISPLAY_ROOT = ".lean-stdlib"
 class AllowedPathRoot:
     root: Path
     display_prefix: str
+    client_absolute: bool = False
 
 
 @dataclass(frozen=True)
@@ -60,7 +61,13 @@ class LeanPathPolicy:
         return f"{allowed.display_prefix}/{relative_text}"
 
     def client_relative_path(self, path: Path | str) -> str:
-        candidate = self.validate_path(path)
+        candidate, allowed = self._resolve_allowed_path(path)
+        if allowed is None:
+            raise ValueError(
+                f"Path '{candidate}' is outside the active Lean project, dependencies, and stdlib roots."
+            )
+        if allowed.client_absolute:
+            return candidate.as_posix()
         return os.path.relpath(candidate, self.project_root)
 
 
@@ -118,7 +125,9 @@ def _stdlib_src_root(project_root: str) -> Path | None:
     return None
 
 
-def build_lean_path_policy(project_root: Path | str) -> LeanPathPolicy:
+def build_lean_path_policy(
+    project_root: Path | str, extra_roots: tuple[Path, ...] = ()
+) -> LeanPathPolicy:
     resolved_root = require_lean_project_path(project_root)
     allowed_roots: list[AllowedPathRoot] = [AllowedPathRoot(resolved_root, "")]
 
@@ -139,6 +148,15 @@ def build_lean_path_policy(project_root: Path | str) -> LeanPathPolicy:
     stdlib_root = _stdlib_src_root(str(resolved_root))
     if stdlib_root is not None:
         allowed_roots.append(AllowedPathRoot(stdlib_root, _STDLIB_DISPLAY_ROOT))
+
+    for index, extra_root in enumerate(extra_roots):
+        allowed_roots.append(
+            AllowedPathRoot(
+                extra_root.resolve(strict=True),
+                f".external/{index}",
+                client_absolute=True,
+            )
+        )
 
     return LeanPathPolicy(
         project_root=resolved_root,

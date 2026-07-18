@@ -206,6 +206,9 @@ This MCP server works out-of-the-box without any configuration. However, a few o
 - `LEAN_LOG_LEVEL`: Log level for the server. Options are "INFO", "WARNING", "ERROR", "NONE". Defaults to "INFO".
 - `LEAN_LOG_FILE_CONFIG`: Config file path for logging, with priority over `LEAN_LOG_LEVEL`. If not set, logs are printed to stdout.
 - `LEAN_PROJECT_PATH`: Path to your Lean project root. A valid Lean project root must contain `lean-toolchain` and either `lakefile.lean` or `lakefile.toml`. Relative `file_path` arguments resolve against this root. This variable is required for `streamable-http` and `sse`.
+- `LEAN_LSP_SERVER_OPTIONS`: JSON object of Lean options applied to every language-server client as `-Dname=value`. Values may be booleans, integers, or strings. Use this when LSP elaboration needs the same options as the project's build; for example, `{"weak.linter.style.header":false}` disables that linter in editor/LSP elaboration. This changes Lean's server configuration rather than filtering diagnostics after they are produced.
+- `LEAN_LSP_MODULE_ROOT`: Optional external source root passed to every language server as `--root=<path>`. Use this when Lean files live outside `LEAN_PROJECT_PATH` but compile against that project.
+- `LEAN_LSP_EXTRA_ROOTS`: Optional JSON array of additional external source roots. These roots are added to `LEAN_PATH` and accepted by file-based tools. `LEAN_LSP_MODULE_ROOT` is automatically included.
 - `LEAN_MCP_DISABLED_TOOLS`: Comma-separated list of tool names to remove from MCP tool listing.
 - `LEAN_MCP_INSTRUCTIONS`: Replacement server instructions string.
 - `LEAN_MCP_TOOL_DESCRIPTIONS`: JSON object mapping tool names to replacement descriptions.
@@ -222,6 +225,51 @@ This MCP server works out-of-the-box without any configuration. However, a few o
 - `LOOGLE_URL`: URL for a self-hosted Loogle instance (default: `https://loogle.lean-lang.org`). Rate limits are skipped when set to a custom backend.
 - `LOOGLE_HEADERS`: JSON object of extra HTTP headers for Loogle requests (e.g. `'{"X-API-Key": "..."}'`).
 
+#### Lean language-server options
+
+`LEAN_LSP_SERVER_OPTIONS` configures Lean elaboration for every client created by
+this MCP server. The value must be a JSON object whose keys omit the `-D` prefix
+and whose values are booleans, integers, or strings:
+
+```bash
+export LEAN_LSP_SERVER_OPTIONS='{"weak.linter.style.header":false,"maxHeartbeats":400000}'
+```
+
+Use this when the language server needs an option that is otherwise present only
+in a build invocation. In Lake configuration, `leanOptions` affect both builds
+and the language server, while `moreLeanArgs` affect compilation only. If a
+project relies on `moreLeanArgs`, the equivalent option may therefore need to be
+supplied here for MCP/LSP elaboration. Project-owned `leanOptions` or
+`moreServerOptions` remain preferable when you control the project and want all
+editors to share the setting.
+
+These options are process-wide: they apply to every Lean project handled by the
+MCP server. Restart the MCP server after changing its environment. This setting
+changes the diagnostics Lean produces; it does not hide or rewrite diagnostic
+results after elaboration.
+
+#### External module roots
+
+For generated or support-theory files outside the Lake project, keep the Lake
+project in `LEAN_PROJECT_PATH` and configure the external module root:
+
+```bash
+export LEAN_PROJECT_PATH=/path/to/lean-eval
+export LEAN_LSP_MODULE_ROOT=/path/to/theory
+export LEAN_LSP_EXTRA_ROOTS='["/path/to/generated-support"]'
+```
+
+The MCP starts `lake serve -- --root=/path/to/theory`, prepends both external
+roots to `LEAN_PATH`, and allows file-based tools to open absolute files under
+those roots. Project, dependency, and stdlib paths keep their existing
+relative display behavior; only explicit external roots use absolute client
+paths because Lean's LSP reports them outside the project URI.
+
+Imported modules under an external source root still need compiled `.olean`
+files, just as they do for a direct Lean invocation. Put the corresponding
+generated `.olean` root in `LEAN_LSP_EXTRA_ROOTS` before the source root,
+or build the external modules into a stable search root first.
+
 You can also often set these environment variables in your MCP client configuration:
 <details>
 <summary><b>VSCode mcp.json Example</b></summary>
@@ -237,7 +285,8 @@ You can also often set these environment variables in your MCP client configurat
             ],
             "env": {
                 "LEAN_PROJECT_PATH": "/path/to/your/lean/project",
-                "LEAN_LOG_LEVEL": "NONE"
+                "LEAN_LOG_LEVEL": "NONE",
+                "LEAN_LSP_SERVER_OPTIONS": "{\"weak.linter.style.header\":false}"
             }
         }
     }
@@ -337,11 +386,15 @@ The REPL binary is auto-detected from `.lake/packages/repl/`. Falls back to LSP 
 
 ### Path Policy
 
-File-based tools only operate on files inside the active Lean project, resolved `.lake/packages/*` dependencies, and the Lean stdlib source tree. Returned file paths are sanitized to avoid leaking host absolute paths:
+File-based tools operate on files inside the active Lean project, resolved
+`.lake/packages/*` dependencies, the Lean stdlib source tree, and explicitly
+configured external roots. Returned file paths are sanitized by default:
 
 - Project files are returned relative to the project root, for example `src/MyFile.lean`.
 - Dependency files are returned under `.lake/packages/<package>/...`.
 - Stdlib files are returned under `.lean-stdlib/...`.
+- External-root files are displayed under `.external/<index>/...`; the client
+  uses their absolute path internally so Lean can track an out-of-project URI.
 
 Symlink escapes outside those roots are rejected.
 

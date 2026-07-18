@@ -28,8 +28,17 @@ class _MockProcess:
 
 
 class _MockLeanClient:
-    def __init__(self, project_path: Path) -> None:
+    def __init__(
+        self,
+        project_path: Path,
+        server_options: dict[str, bool | int | str] | None = None,
+        server_arguments: tuple[str, ...] | None = None,
+        server_env: dict[str, str] | None = None,
+    ) -> None:
         self.project_path = project_path
+        self.server_options = dict(server_options or {})
+        self.server_arguments = tuple(server_arguments or ())
+        self.server_env = dict(server_env or {})
         self.process = _MockProcess()
         self.closed = False
 
@@ -108,8 +117,13 @@ def patched_clients(monkeypatch: pytest.MonkeyPatch) -> list[_MockLeanClient]:
         prevent_cache_get: bool = False,
         **kwargs,
     ) -> _MockLeanClient:  # pragma: no cover - signature verified indirectly
-        _ = initial_build, prevent_cache_get, kwargs
-        client = _MockLeanClient(project_path)
+        _ = initial_build, prevent_cache_get
+        client = _MockLeanClient(
+            project_path,
+            kwargs.get("server_options"),
+            kwargs.get("server_arguments"),
+            kwargs.get("server_env"),
+        )
         created.append(client)
         return client
 
@@ -131,6 +145,57 @@ def test_startup_client_reuses_existing(
     startup_client(ctx)
     assert ctx.request_context.lifespan_context.client is first
     assert len(patched_clients) == 1
+
+
+def test_startup_client_passes_server_options(
+    tmp_path: Path,
+    patched_clients: list[_MockLeanClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    monkeypatch.setenv("LEAN_LSP_SERVER_OPTIONS", '{"weak.linter.style.header":false}')
+    ctx = _Context(_LifespanContext(project, None))
+
+    startup_client(ctx)
+
+    assert patched_clients[0].server_options == {"weak.linter.style.header": False}
+
+
+def test_startup_client_restarts_when_server_options_change(
+    tmp_path: Path,
+    patched_clients: list[_MockLeanClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    ctx = _Context(_LifespanContext(project, None))
+
+    startup_client(ctx)
+    first = patched_clients[0]
+
+    monkeypatch.setenv("LEAN_LSP_SERVER_OPTIONS", '{"autoImplicit":false}')
+    startup_client(ctx)
+
+    assert first.closed
+    assert patched_clients[1].server_options == {"autoImplicit": False}
+    assert ctx.request_context.lifespan_context.client is patched_clients[1]
+
+
+def test_setup_client_for_external_module_root(
+    tmp_path: Path,
+    patched_clients: list[_MockLeanClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    theory_root = tmp_path / "theory"
+    theory_file = theory_root / "Support" / "Example.lean"
+    theory_file.parent.mkdir(parents=True)
+    theory_file.write_text("theorem external : True := by trivial\n")
+    monkeypatch.setenv("LEAN_LSP_MODULE_ROOT", str(theory_root))
+    ctx = _Context(_LifespanContext(project, None))
+
+    assert setup_client_for_file(ctx, str(theory_file)) == theory_file.as_posix()
+    assert patched_clients[0].server_arguments == (f"--root={theory_root}",)
+    assert patched_clients[0].server_env == {"LEAN_PATH": str(theory_root)}
 
 
 def test_startup_client_keeps_project_specific_clients(

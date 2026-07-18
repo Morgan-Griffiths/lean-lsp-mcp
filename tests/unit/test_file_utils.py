@@ -102,6 +102,41 @@ def test_build_lean_path_policy_rejects_symlink_escape(tmp_path: Path) -> None:
         policy.validate_path(resolved)
 
 
+def test_build_lean_path_policy_allows_external_module_root(tmp_path: Path) -> None:
+    project = _make_project(tmp_path / "proj")
+    theory_root = tmp_path / "theory"
+    theory_file = theory_root / "Support" / "Example.lean"
+    theory_file.parent.mkdir(parents=True)
+    theory_file.write_text("theorem external : True := by trivial\n")
+
+    policy = build_lean_path_policy(project, (theory_root,))
+
+    assert policy.validate_path(theory_file) == theory_file
+    assert policy.display_path(theory_file) == ".external/0/Support/Example.lean"
+    assert policy.client_relative_path(theory_file) == theory_file.as_posix()
+
+
+def test_external_root_does_not_shadow_dependency_classification(
+    tmp_path: Path,
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    dep_real_root = tmp_path / "deps" / "mathlib"
+    dep_file = dep_real_root / "Mathlib" / "Algebra" / "Group.lean"
+    dep_file.parent.mkdir(parents=True)
+    dep_file.write_text("theorem depThm : True := by trivial\n")
+    dep_link = project / ".lake" / "packages" / "mathlib"
+    dep_link.parent.mkdir(parents=True)
+    dep_link.symlink_to(dep_real_root, target_is_directory=True)
+
+    policy = build_lean_path_policy(project, (tmp_path,))
+
+    assert (
+        policy.display_path(dep_file)
+        == ".lake/packages/mathlib/Mathlib/Algebra/Group.lean"
+    )
+    assert policy.client_relative_path(dep_file) == os.path.relpath(dep_file, project)
+
+
 def test_get_file_contents_fallback_encoding(tmp_path: Path) -> None:
     latin1_file = tmp_path / "latin1.txt"
     latin1_file.write_text("caf\xe9", encoding="latin-1")
