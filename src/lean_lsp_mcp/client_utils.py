@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 
 from leanclient.aio import AsyncLeanLSPClient, ScratchPool
@@ -190,12 +191,8 @@ def attach_shared_client(project_path: Path | str, client: AsyncLeanLSPClient) -
     _shared_clients[project_key] = client
 
 
-def close_shared_client(project_path: Path | str | None = None) -> None:
-    """Terminate shared clients synchronously (process-exit path).
-
-    Safe to call after the event loop has closed: kills the ``lake serve``
-    process groups directly instead of awaiting a graceful close.
-    """
+def take_shared_clients(project_path: Path | str | None = None) -> list[AsyncLeanLSPClient]:
+    """Remove and return cached clients without closing them."""
     if project_path is None:
         clients = list(_shared_clients.values())
         _shared_clients.clear()
@@ -210,6 +207,12 @@ def close_shared_client(project_path: Path | str | None = None) -> None:
         _shared_pools.pop(project_key, None)
         _builds_in_progress.discard(project_key)
 
+    return clients
+
+
+def close_shared_client(project_path: Path | str | None = None) -> None:
+    """Terminate shared clients synchronously on the process-exit path."""
+    clients = take_shared_clients(project_path)
     for client in clients:
         try:
             client._transport._kill_group()
@@ -219,6 +222,7 @@ def close_shared_client(project_path: Path | str | None = None) -> None:
 
 async def startup_client(ctx: Context) -> AsyncLeanLSPClient:
     """Ensure the shared async Lean client for the session's project is up."""
+    ctx.request_context.lifespan_context.last_lsp_activity = time.monotonic()
     async with CLIENT_LOCK:
         configured_root = ctx.request_context.lifespan_context.lean_project_path
         if configured_root is None:
