@@ -11,6 +11,7 @@ from lean_lsp_mcp.client_utils import (
     attach_shared_client,
     bind_lean_project_path,
     close_shared_client,
+    get_path_policy,
     resolve_file_path,
     set_build_in_progress,
     setup_client_for_file,
@@ -67,6 +68,8 @@ class _LifespanContext:
         self.project_switching_allowed = project_switching_allowed
         self.file_content_hashes: dict[str, int] = {}
         self.project_cache: dict[str, Path | str] = {}
+        self.external_module_root: Path | None = None
+        self.external_extra_roots: tuple[Path, ...] = ()
 
 
 class _RequestContext:
@@ -100,10 +103,12 @@ def _make_dependency(project: Path, dep_root: Path) -> Path:
 @pytest.fixture(autouse=True)
 def _reset_shared_clients() -> None:
     client_utils._shared_clients.clear()
+    client_utils._shared_client_commands.clear()
     client_utils._shared_pools.clear()
     client_utils._builds_in_progress.clear()
     yield
     client_utils._shared_clients.clear()
+    client_utils._shared_client_commands.clear()
     client_utils._shared_pools.clear()
     client_utils._builds_in_progress.clear()
 
@@ -112,7 +117,9 @@ def _reset_shared_clients() -> None:
 def patched_clients(monkeypatch: pytest.MonkeyPatch) -> list[_MockAioClient]:
     created: list[_MockAioClient] = []
 
-    async def _constructor(project_path: Path) -> _MockAioClient:
+    async def _constructor(
+        project_path: Path, server_command: tuple[str, ...] = ("lake", "serve", "--")
+    ) -> _MockAioClient:
         client = _MockAioClient(project_path)
         created.append(client)
         return client
@@ -140,6 +147,42 @@ async def test_startup_client_reuses_existing(
     assert ctx.request_context.lifespan_context.client is first
     assert ctx.request_context.lifespan_context.last_lsp_activity > 0
     assert len(patched_clients) == 1
+
+
+@pytest.mark.asyncio
+async def test_startup_client_restarts_when_module_root_changes(
+    tmp_path: Path, patched_clients: list[_MockAioClient]
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    module_root = tmp_path / "theory"
+    module_root.mkdir()
+    ctx = _Context(_LifespanContext(project, None))
+
+    await startup_client(ctx)
+    first = ctx.request_context.lifespan_context.client
+    ctx.request_context.lifespan_context.external_module_root = module_root
+    await startup_client(ctx)
+
+    assert first is not None
+    assert first.closed
+    assert ctx.request_context.lifespan_context.client is not first
+    assert len(patched_clients) == 2
+
+
+def test_path_policy_accepts_session_external_root(tmp_path: Path) -> None:
+    project = _make_project(tmp_path / "proj")
+    external_root = tmp_path / "theory"
+    external_file = external_root / "Support" / "Theorem.lean"
+    external_file.parent.mkdir(parents=True)
+    external_file.write_text("theorem external : True := by trivial\n")
+    lifespan = _LifespanContext(project, None)
+    lifespan.external_module_root = external_root
+    ctx = _Context(lifespan)
+
+    policy = get_path_policy(ctx)
+
+    assert policy.contains(external_file)
+    assert policy.client_relative_path(external_file) == external_file.as_posix()
 
 
 @pytest.mark.asyncio
