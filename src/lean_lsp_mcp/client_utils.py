@@ -19,6 +19,7 @@ from lean_lsp_mcp import config
 logger = get_logger(__name__)
 CLIENT_LOCK = asyncio.Lock()
 _shared_clients: dict[Path, AsyncLeanLSPClient] = {}
+_shared_client_commands: dict[Path, tuple[str, ...]] = {}
 _shared_pools: dict[Path, ScratchPool] = {}
 _builds_in_progress: set[Path] = set()
 
@@ -82,14 +83,41 @@ def get_path_policy(ctx: Context, project_path: Path | None = None) -> LeanPathP
     root = project_path or getattr(lifespan, "lean_project_path", None)
     if root is None:
         raise ValueError("lean project path is not set.")
-    return build_lean_path_policy(root)
+    return build_lean_path_policy(root, _effective_extra_roots(ctx))
 
 
-async def _start_client(project_path: Path) -> AsyncLeanLSPClient:
+def _effective_extra_roots(ctx: Context | None) -> tuple[Path, ...]:
+    if ctx is None:
+        return ()
+    lifespan = ctx.request_context.lifespan_context
+    roots: list[Path] = []
+    module_root = getattr(lifespan, "external_module_root", None)
+    if module_root is not None:
+        roots.append(module_root)
+    for root in getattr(lifespan, "external_extra_roots", ()):
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def _effective_server_command(ctx: Context | None) -> tuple[str, ...]:
+    command = ("lake", "serve", "--")
+    if ctx is None:
+        return command
+    module_root = getattr(ctx.request_context.lifespan_context, "external_module_root", None)
+    if module_root is None:
+        return command
+    return (*command, f"--root={module_root}")
+
+
+async def _start_client(
+    project_path: Path, server_command: tuple[str, ...] = ("lake", "serve", "--")
+) -> AsyncLeanLSPClient:
     try:
         client = AsyncLeanLSPClient(
             str(project_path),
             max_workers=_max_opened_files(),
+            server_command=list(server_command),
         )
         await client.start()
         logger.info("Shared async LSP client connected at %s", project_path)
@@ -105,6 +133,7 @@ async def _evict_oldest_client() -> None:
     """Close and remove the oldest shared client to stay within the cap."""
     oldest_key = next(iter(_shared_clients))
     old = _shared_clients.pop(oldest_key)
+    _shared_client_commands.pop(oldest_key, None)
     _shared_pools.pop(oldest_key, None)
     try:
         await old.close()
@@ -114,8 +143,10 @@ async def _evict_oldest_client() -> None:
 
 async def _get_or_create_shared_client(
     lean_project_path: Path,
+    ctx: Context | None = None,
 ) -> AsyncLeanLSPClient:
     project_key = lean_project_path.resolve(strict=False)
+    server_command = _effective_server_command(ctx)
 
     if project_key in _builds_in_progress:
         raise ValueError(
@@ -123,11 +154,16 @@ async def _get_or_create_shared_client(
         )
 
     client = _shared_clients.get(project_key)
-    if client is not None and client.alive:
+    if (
+        client is not None
+        and client.alive
+        and _shared_client_commands.get(project_key) == server_command
+    ):
         return client
 
     if client is not None:
         _shared_clients.pop(project_key, None)
+        _shared_client_commands.pop(project_key, None)
         _shared_pools.pop(project_key, None)
         try:
             await client.close()
@@ -137,8 +173,9 @@ async def _get_or_create_shared_client(
     if len(_shared_clients) >= _MAX_SHARED_CLIENTS:
         await _evict_oldest_client()
 
-    client = await _start_client(project_key)
+    client = await _start_client(project_key, server_command)
     _shared_clients[project_key] = client
+    _shared_client_commands[project_key] = server_command
     return client
 
 
@@ -183,12 +220,14 @@ async def detach_shared_client(
     """Remove (without closing) the shared client for a project."""
     project_key = Path(project_path).resolve(strict=False)
     _shared_pools.pop(project_key, None)
+    _shared_client_commands.pop(project_key, None)
     return _shared_clients.pop(project_key, None)
 
 
 def attach_shared_client(project_path: Path | str, client: AsyncLeanLSPClient) -> None:
     project_key = Path(project_path).resolve(strict=False)
     _shared_clients[project_key] = client
+    _shared_client_commands[project_key] = ("lake", "serve", "--")
 
 
 def take_shared_clients(project_path: Path | str | None = None) -> list[AsyncLeanLSPClient]:
@@ -196,12 +235,14 @@ def take_shared_clients(project_path: Path | str | None = None) -> list[AsyncLea
     if project_path is None:
         clients = list(_shared_clients.values())
         _shared_clients.clear()
+        _shared_client_commands.clear()
         _shared_pools.clear()
         _builds_in_progress.clear()
     else:
         project_key = Path(project_path).resolve(strict=False)
         clients = []
         client = _shared_clients.pop(project_key, None)
+        _shared_client_commands.pop(project_key, None)
         if client is not None:
             clients.append(client)
         _shared_pools.pop(project_key, None)
@@ -228,7 +269,7 @@ async def startup_client(ctx: Context) -> AsyncLeanLSPClient:
         if configured_root is None:
             raise ValueError("lean project path is not set.")
         lean_project_path = bind_lean_project_path(ctx, configured_root)
-        client = await _get_or_create_shared_client(lean_project_path)
+        client = await _get_or_create_shared_client(lean_project_path, ctx)
         ctx.request_context.lifespan_context.client = client
         return client
 
@@ -294,7 +335,9 @@ def infer_project_path(file_path: str, ctx: Context | None = None) -> Path | Non
 
     if ctx and lifespan.lean_project_path:
         try:
-            current_policy = build_lean_path_policy(lifespan.lean_project_path)
+            current_policy = build_lean_path_policy(
+                lifespan.lean_project_path, _effective_extra_roots(ctx)
+            )
         except ValueError:
             current_policy = None
         if current_policy is not None and current_policy.contains(resolved_input):
@@ -311,7 +354,9 @@ def infer_project_path(file_path: str, ctx: Context | None = None) -> Path | Non
             cached_root = lifespan.project_cache.get(current_dir_str)
             if cached_root:
                 try:
-                    cached_policy = build_lean_path_policy(Path(cached_root))
+                    cached_policy = build_lean_path_policy(
+                        Path(cached_root), _effective_extra_roots(ctx)
+                    )
                 except ValueError:
                     lifespan.project_cache[current_dir_str] = ""
                 else:
@@ -347,7 +392,7 @@ async def setup_client_for_file(ctx: Context, file_path: str) -> str | None:
         return None
 
     try:
-        policy = build_lean_path_policy(project_path)
+        policy = build_lean_path_policy(project_path, _effective_extra_roots(ctx))
     except ValueError:
         return None
     if not policy.contains(resolved_file):
