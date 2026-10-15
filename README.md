@@ -207,7 +207,10 @@ This MCP server works out-of-the-box without any configuration. However, a few o
 - `LEAN_LOG_FILE_CONFIG`: Config file path for logging, with priority over `LEAN_LOG_LEVEL`. If not set, logs are printed to stdout.
 - `LEAN_PROJECT_PATH`: Path to your Lean project root. A valid Lean project root must contain `lean-toolchain` and either `lakefile.lean` or `lakefile.toml`. Relative `file_path` arguments resolve against this root. This variable is required for `streamable-http` and `sse`.
 - `LEAN_LSP_MAX_OPEN_FILES`: Maximum number of Lean files retained by one language-server client. Defaults to `4`; set it to `1` when memory is constrained.
-- `LEAN_LSP_IDLE_TIMEOUT_SECONDS`: For `stdio` transport, close an idle Lean language-server tree after this many seconds while leaving the MCP wrapper reusable. Defaults to `600`; set a non-positive value to disable idle cleanup. The next LSP-backed tool call recreates the client. Multi-session `streamable-http` and `sse` transports are not idle-evicted.
+- `LEAN_LSP_IDLE_TIMEOUT_SECONDS`: For `stdio` transport, close an idle Lean language-server tree after this many seconds while leaving the MCP wrapper reusable. Defaults to `600`; set a non-positive value to disable idle cleanup. Active tool calls and prewarming are protected, and the idle interval starts when they finish. The next LSP-backed tool call recreates the client. Multi-session `streamable-http` and `sse` transports are not idle-evicted.
+- `LEAN_LSP_SERVER_OPTIONS`: JSON object of Lean options applied to the language server as `-Dname=value`. Values may be booleans, integers, or strings. Use this to match build-time elaboration options, for example `{"weak.linter.style.header":false}`.
+- `LEAN_LSP_MODULE_ROOT`: Optional external source root passed to Lean as `--root=<path>`. Use this when source files live outside the Lake project that supplies their dependencies.
+- `LEAN_LSP_EXTRA_ROOTS`: Optional JSON array of additional source or generated `.olean` roots. These directories are permitted by file-based tools and added to the language server's import search path, together with the module root and any existing `LEAN_PATH`.
 - `LEAN_MCP_DISABLED_TOOLS`: Comma-separated list of tool names to remove from MCP tool listing.
 - `LEAN_MCP_INSTRUCTIONS`: Replacement server instructions string.
 - `LEAN_MCP_TOOL_DESCRIPTIONS`: JSON object mapping tool names to replacement descriptions.
@@ -255,7 +258,9 @@ The Lean LSP MCP server supports the following transport methods:
 - `streamable-http`: HTTP streaming
 - `sse`: Server-sent events (MCP legacy, use `streamable-http` if possible)
 
-`stdio` supports project inference and switching as you move between Lean projects. `streamable-http` and `sse` are single-project deployments: they require `LEAN_PROJECT_PATH` at startup and reject tool-driven project switching.
+`stdio` supports project inference and switching as you move between Lean projects. Use `lean_set_project_context` to select the Lake project, an optional external `module_root`, and any `extra_roots` needed for imports. These session settings replace the environment-configured roots until the context is changed again.
+
+`streamable-http` and `sse` are single-project deployments: they require `LEAN_PROJECT_PATH` at startup and reject tool-driven changes to the project or external roots. Configure their external roots through the environment before starting the server.
 
 You can specify the transport method using the `--transport` argument when running the server. For `sse` and `streamable-http` you can also optionally specify the host and port:
 

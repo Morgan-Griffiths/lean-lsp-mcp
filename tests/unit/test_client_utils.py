@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from lean_lsp_mcp import client_utils
+from lean_lsp_mcp import client_utils, config
 from lean_lsp_mcp.client_utils import (
     attach_shared_client,
     bind_lean_project_path,
@@ -70,6 +74,7 @@ class _LifespanContext:
         self.project_cache: dict[str, Path | str] = {}
         self.external_module_root: Path | None = None
         self.external_extra_roots: tuple[Path, ...] = ()
+        self.external_roots_configured = False
 
 
 class _RequestContext:
@@ -101,7 +106,14 @@ def _make_dependency(project: Path, dep_root: Path) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _reset_shared_clients() -> None:
+def _reset_shared_clients(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in (
+        config.MODULE_ROOT_ENV,
+        config.EXTRA_ROOTS_ENV,
+        config.SERVER_OPTIONS_ENV,
+        "LEAN_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
     client_utils._shared_clients.clear()
     client_utils._shared_client_commands.clear()
     client_utils._shared_pools.clear()
@@ -121,6 +133,7 @@ def patched_clients(monkeypatch: pytest.MonkeyPatch) -> list[_MockAioClient]:
         project_path: Path, server_command: tuple[str, ...] = ("lake", "serve", "--")
     ) -> _MockAioClient:
         client = _MockAioClient(project_path)
+        client.server_command = server_command
         created.append(client)
         return client
 
@@ -134,18 +147,13 @@ async def test_startup_client_reuses_existing(
 ) -> None:
     project = _make_project(tmp_path / "proj")
     ctx = _Context(_LifespanContext(project, None))
-    ctx.request_context.lifespan_context.last_lsp_activity = 0.0
 
     await startup_client(ctx)
     first = ctx.request_context.lifespan_context.client
     assert isinstance(first, _MockAioClient)
     assert not first.closed
-    assert ctx.request_context.lifespan_context.last_lsp_activity > 0
-
-    ctx.request_context.lifespan_context.last_lsp_activity = 0.0
     await startup_client(ctx)
     assert ctx.request_context.lifespan_context.client is first
-    assert ctx.request_context.lifespan_context.last_lsp_activity > 0
     assert len(patched_clients) == 1
 
 
@@ -161,6 +169,7 @@ async def test_startup_client_restarts_when_module_root_changes(
     await startup_client(ctx)
     first = ctx.request_context.lifespan_context.client
     ctx.request_context.lifespan_context.external_module_root = module_root
+    ctx.request_context.lifespan_context.external_roots_configured = True
     await startup_client(ctx)
 
     assert first is not None
@@ -177,6 +186,7 @@ def test_path_policy_accepts_session_external_root(tmp_path: Path) -> None:
     external_file.write_text("theorem external : True := by trivial\n")
     lifespan = _LifespanContext(project, None)
     lifespan.external_module_root = external_root
+    lifespan.external_roots_configured = True
     ctx = _Context(lifespan)
 
     policy = get_path_policy(ctx)
@@ -448,3 +458,188 @@ def test_resolve_file_path_uses_project_root_for_relative(tmp_path: Path) -> Non
     ctx = _Context(_LifespanContext(project, None))
     resolved = resolve_file_path(ctx, "src/Example.lean")
     assert resolved == target.resolve()
+
+
+@pytest.mark.asyncio
+async def test_start_client_passes_command_to_async_client(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = MagicMock(start=AsyncMock())
+    constructor = MagicMock(return_value=client)
+    monkeypatch.setattr(client_utils, "AsyncLeanLSPClient", constructor)
+    command = ("lake", "serve", "--", "-DautoImplicit=false")
+
+    assert await client_utils._start_client(tmp_path, command) is client
+
+    constructor.assert_called_once_with(
+        str(tmp_path), max_workers=config.max_open_files(), server_command=list(command)
+    )
+    client.start.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_server_option_change_restarts_client_but_order_does_not(
+    tmp_path: Path,
+    patched_clients: list[_MockAioClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    ctx = _Context(_LifespanContext(project, None))
+    monkeypatch.setenv(
+        config.SERVER_OPTIONS_ENV, '{"autoImplicit":false,"maxHeartbeats":400000}'
+    )
+    first = await startup_client(ctx)
+    assert first.server_command == (
+        "lake",
+        "serve",
+        "--",
+        "-DautoImplicit=false",
+        "-DmaxHeartbeats=400000",
+    )
+
+    monkeypatch.setenv(
+        config.SERVER_OPTIONS_ENV, '{"maxHeartbeats":400000,"autoImplicit":false}'
+    )
+    assert await startup_client(ctx) is first
+    monkeypatch.setenv(config.SERVER_OPTIONS_ENV, '{"autoImplicit":true}')
+    second = await startup_client(ctx)
+
+    assert first.closed
+    assert second is not first
+    assert second.server_command[-1] == "-DautoImplicit=true"
+    assert len(patched_clients) == 2
+
+
+def test_string_server_option_is_one_unquoted_argument(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(config.SERVER_OPTIONS_ENV, '{"output":"a file"}')
+    assert client_utils._effective_server_command(None) == (
+        "lake",
+        "serve",
+        "--",
+        "-Doutput=a file",
+    )
+
+
+@pytest.mark.asyncio
+async def test_extra_roots_and_inherited_lean_path_invalidate_client(
+    tmp_path: Path,
+    patched_clients: list[_MockAioClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    lifespan = _LifespanContext(project, None)
+    lifespan.external_roots_configured = True
+    ctx = _Context(lifespan)
+    first = await startup_client(ctx)
+
+    lifespan.external_extra_roots = (generated,)
+    second = await startup_client(ctx)
+    assert second is not first
+    assert first.closed
+    assert second.server_command[3] == str(generated)
+    assert await startup_client(ctx) is second
+
+    monkeypatch.setenv("LEAN_PATH", "inherited")
+    third = await startup_client(ctx)
+    assert second.closed
+    assert third.server_command[3] == f"{generated}{os.pathsep}inherited"
+    assert len(patched_clients) == 3
+
+
+def test_external_root_environment_is_only_changed_in_child(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module_root = tmp_path / "theory 'quoted'"
+    module_root.mkdir()
+    generated = tmp_path / "generated"
+    generated.mkdir()
+    monkeypatch.setenv(config.MODULE_ROOT_ENV, str(module_root))
+    monkeypatch.setenv(config.EXTRA_ROOTS_ENV, json.dumps([str(generated)]))
+    monkeypatch.setenv("LEAN_PATH", "inherited")
+    command = client_utils._effective_server_command(None)
+    assert command[4:] == ("lake", "serve", "--", f"--root={module_root}")
+
+    # Exercise the environment wrapper without starting Lake or Lean.
+    child = subprocess.run(
+        [
+            *command[:4],
+            sys.executable,
+            "-c",
+            "import os; print(os.environ['LEAN_PATH'])",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+
+    assert child.stdout.strip() == os.pathsep.join(
+        (str(module_root), str(generated), "inherited")
+    )
+    assert os.environ["LEAN_PATH"] == "inherited"
+
+
+@pytest.mark.asyncio
+async def test_attached_configured_client_is_reused(
+    tmp_path: Path,
+    patched_clients: list[_MockAioClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    monkeypatch.setenv(config.SERVER_OPTIONS_ENV, '{"autoImplicit":false}')
+    ctx = _Context(_LifespanContext(project, None))
+    client = _MockAioClient(project)
+    attach_shared_client(project, client, client_utils._effective_server_command(ctx))
+
+    assert await startup_client(ctx) is client
+    assert patched_clients == []
+
+
+@pytest.mark.asyncio
+async def test_cancelled_startup_closes_client_before_cache_insertion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = _make_project(tmp_path / "proj")
+    started = asyncio.Event()
+
+    async def pending_start() -> None:
+        started.set()
+        await asyncio.Future()
+
+    client = MagicMock(start=pending_start, close=AsyncMock())
+    monkeypatch.setattr(
+        client_utils, "AsyncLeanLSPClient", MagicMock(return_value=client)
+    )
+    ctx = _Context(_LifespanContext(project, None))
+    startup = asyncio.create_task(startup_client(ctx))
+    await started.wait()
+
+    startup.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await startup
+
+    client.close.assert_awaited_once()
+    assert client_utils._shared_clients == {}
+    assert ctx.request_context.lifespan_context.client is None
+
+
+@pytest.mark.asyncio
+async def test_failed_startup_closes_client_and_preserves_start_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = MagicMock(
+        start=AsyncMock(side_effect=RuntimeError("startup failed")),
+        close=AsyncMock(side_effect=RuntimeError("cleanup failed")),
+    )
+    monkeypatch.setattr(
+        client_utils, "AsyncLeanLSPClient", MagicMock(return_value=client)
+    )
+
+    with pytest.raises(ValueError, match="startup failed"):
+        await client_utils._start_client(tmp_path)
+
+    client.close.assert_awaited_once()

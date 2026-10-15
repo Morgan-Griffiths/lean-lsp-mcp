@@ -8,8 +8,15 @@ import re
 import ssl
 import time
 import urllib.request
-from collections.abc import AsyncIterator, Callable, Coroutine, Iterable
-from contextlib import asynccontextmanager
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Iterable,
+    Iterator,
+    Sequence,
+)
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, NoReturn, Optional, cast
@@ -24,10 +31,15 @@ from leanclient.aio import (
 from mcp.server.auth.settings import AuthSettings
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.fastmcp.utilities.logging import configure_logging, get_logger
+from mcp.types import ContentBlock
 
 from lean_lsp_mcp.client_utils import (
+    CLIENT_LOCK,
     _active_transport,
+    _effective_server_command,
+    _get_or_create_shared_client,
     _project_switching_allowed,
+    _start_client,
     attach_shared_client,
     detach_shared_client,
     get_scratch_pool,
@@ -257,6 +269,19 @@ class BuildCoordinator:
                         raise
                     continue
 
+    async def close(self) -> None:
+        """Stop the shielded build before its session releases shared clients."""
+        task = self._current_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.exception("Build cancellation failed during session shutdown")
+
 
 # ---------------------------------------------------------------------------
 # Shared singletons for resources that should NOT be duplicated per-session.
@@ -317,6 +342,7 @@ class AppContext:
     lean_search_available: bool
     external_module_root: Path | None = None
     external_extra_roots: tuple[Path, ...] = ()
+    external_roots_configured: bool = False
     active_transport: str = "stdio"
     project_switching_allowed: bool = True
     loogle_manager: LoogleManager | None = None
@@ -326,10 +352,30 @@ class AppContext:
     repl_enabled: bool = False
     build_coordinator: BuildCoordinator | None = None
     last_lsp_activity: float = 0.0
+    active_operations: int = 0
+
+
+@contextmanager
+def _lsp_activity(context: AppContext) -> Iterator[None]:
+    """Keep clients alive for the whole operation and start idle time at completion."""
+    context.active_operations += 1
+    try:
+        yield
+    finally:
+        context.active_operations -= 1
+        context.last_lsp_activity = time.monotonic()
+
+
+class LeanMCP(FastMCP[AppContext]):
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any]
+    ) -> Sequence[ContentBlock] | dict[str, Any]:
+        with _lsp_activity(self.get_context().request_context.lifespan_context):
+            return await super().call_tool(name, arguments)
 
 
 async def _close_stdio_client(context: AppContext, failure_message: str) -> None:
-    """Close this stdio session's project client and remove its cache entry."""
+    """Close this stdio session's cached clients, including prewarmed clients."""
     client = context.client
     context.client = None
     clients_to_close: list[AsyncLeanLSPClient] = []
@@ -350,58 +396,59 @@ async def _close_idle_stdio_client(context: AppContext, timeout_seconds: float) 
     poll_seconds = min(timeout_seconds, 30.0)
     while True:
         await asyncio.sleep(poll_seconds)
-        if context.client is None:
+        if context.active_operations:
             continue
         if time.monotonic() - context.last_lsp_activity < timeout_seconds:
             continue
-        logger.info("Stdio Lean client idle for %.1fs; closing it", timeout_seconds)
-        await _close_stdio_client(context, "Lean client close failed during idle teardown")
+        await _close_stdio_client(
+            context, "Lean client close failed during idle teardown"
+        )
 
 
 _prewarm_started = False
 
 
-async def _prewarm_project_files(project_path: Path, files: List[str]) -> None:
+async def _prewarm_project_files(context: AppContext, files: List[str]) -> None:
     """Open/elaborate configured files in the background at server startup.
 
     Overlaps the expensive first elaboration with the agent's initial
     reading/planning phase instead of landing on its first tool call
     (LEAN_MCP_PREWARM_FILES, project-relative, comma-separated).
     """
-    from lean_lsp_mcp.client_utils import CLIENT_LOCK, _get_or_create_shared_client
+    assert context.lean_project_path is not None
+    with _lsp_activity(context):
+        try:
+            async with CLIENT_LOCK:
+                client = await _get_or_create_shared_client(context.lean_project_path)
+            opened = []
+            for rel_path in files:
+                try:
+                    await client.open(rel_path, wait=False)
+                    opened.append(rel_path)
+                except (OSError, LeanClientError) as exc:
+                    logger.warning("Prewarm skipped %s: %s", rel_path, exc)
+            logger.info("Prewarm started for %s file(s): %s", len(opened), opened)
+            for rel_path in opened:
+                try:
+                    await client.barrier(rel_path)
+                    logger.info("Prewarm complete: %s", rel_path)
+                except LeanClientError as exc:
+                    logger.warning(
+                        "Prewarm elaboration failed for %s: %s", rel_path, exc
+                    )
+        except Exception:
+            logger.exception("Prewarm task failed")
 
-    try:
-        async with CLIENT_LOCK:
-            client = await _get_or_create_shared_client(project_path)
-        opened = []
-        for rel_path in files:
-            try:
-                await client.open(rel_path, wait=False)
-                opened.append(rel_path)
-            except (OSError, LeanClientError) as exc:
-                logger.warning("Prewarm skipped %s: %s", rel_path, exc)
-        logger.info("Prewarm started for %s file(s): %s", len(opened), opened)
-        for rel_path in opened:
-            try:
-                await client.barrier(rel_path)
-                logger.info("Prewarm complete: %s", rel_path)
-            except LeanClientError as exc:
-                logger.warning("Prewarm elaboration failed for %s: %s", rel_path, exc)
-    except Exception:
-        logger.exception("Prewarm task failed")
 
-
-def _maybe_start_prewarm(lean_project_path: Path | None) -> None:
+def _maybe_start_prewarm(context: AppContext) -> asyncio.Task[None] | None:
     global _prewarm_started
-    if _prewarm_started or lean_project_path is None:
-        return
+    if _prewarm_started or context.lean_project_path is None:
+        return None
     files = config.prewarm_files()
     if not files:
-        return
+        return None
     _prewarm_started = True
-    asyncio.get_running_loop().create_task(
-        _prewarm_project_files(lean_project_path, files)
-    )
+    return asyncio.create_task(_prewarm_project_files(context, files))
 
 
 @asynccontextmanager
@@ -409,6 +456,7 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
     repl: Repl | None = None
     context: AppContext | None = None
     idle_cleanup_task: asyncio.Task[None] | None = None
+    prewarm_task: asyncio.Task[None] | None = None
 
     try:
         active_transport = _active_transport()
@@ -472,10 +520,11 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
             build_coordinator=build_coordinator,
             last_lsp_activity=time.monotonic(),
         )
-        _maybe_start_prewarm(lean_project_path)
-        if active_transport == "stdio" and (
-            idle_timeout_seconds := config.idle_timeout_seconds()
-        ) is not None:
+        prewarm_task = _maybe_start_prewarm(context)
+        if (
+            active_transport == "stdio"
+            and (idle_timeout_seconds := config.idle_timeout_seconds()) is not None
+        ):
             idle_cleanup_task = asyncio.create_task(
                 _close_idle_stdio_client(context, idle_timeout_seconds)
             )
@@ -491,6 +540,14 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[AppContext]:
                 pass
 
         if context and context.active_transport == "stdio":
+            if context.build_coordinator is not None:
+                await context.build_coordinator.close()
+            if prewarm_task is not None:
+                prewarm_task.cancel()
+                try:
+                    await prewarm_task
+                except asyncio.CancelledError:
+                    pass
             # A stdio MCP process serves exactly one client session. Keeping
             # its project-scoped client alive after that session ends retains
             # the whole lake-serve tree until the wrapper process exits.
@@ -525,7 +582,7 @@ if auth_token:
     )
     mcp_kwargs["token_verifier"] = PreSharedTokenVerifier(auth_token)
 
-mcp = FastMCP(**mcp_kwargs)
+mcp = LeanMCP(**mcp_kwargs)
 
 # Symbols imported here but used only by the tool subpackage (via `server.X`)
 # or by tests through monkeypatching. Listing them in __all__ marks them as
@@ -672,119 +729,124 @@ async def _run_build(
         if remainder:
             await _handle_build_output_line(remainder)
 
-    try:
-        set_build_in_progress(lean_project_path_obj, True)
-        build_flag_set = True
-        client = ctx.request_context.lifespan_context.client
-        ctx.request_context.lifespan_context.client = None
-        shared_client = await detach_shared_client(lean_project_path_obj)
+    with _lsp_activity(ctx.request_context.lifespan_context):
+        try:
+            set_build_in_progress(lean_project_path_obj, True)
+            build_flag_set = True
+            client = ctx.request_context.lifespan_context.client
+            ctx.request_context.lifespan_context.client = None
+            shared_client = await detach_shared_client(lean_project_path_obj)
 
-        clients_to_close: list[AsyncLeanLSPClient] = []
-        for candidate in (client, shared_client):
-            if candidate is None or candidate in clients_to_close:
-                continue
-            clients_to_close.append(candidate)
+            clients_to_close: list[AsyncLeanLSPClient] = []
+            for candidate in (client, shared_client):
+                if candidate is None or candidate in clients_to_close:
+                    continue
+                clients_to_close.append(candidate)
 
-        for client_to_close in clients_to_close:
-            try:
-                await client_to_close.close()
-            except Exception:
-                logger.exception("Lean client close failed during lsp_build restart")
+            for client_to_close in clients_to_close:
+                try:
+                    await client_to_close.close()
+                except Exception:
+                    logger.exception(
+                        "Lean client close failed during lsp_build restart"
+                    )
 
-        if clean:
-            await _safe_report_progress(
-                ctx, progress=1, total=16, message="Running `lake clean`"
-            )
-            clean_proc = await _run_proc(
+            if clean:
+                await _safe_report_progress(
+                    ctx, progress=1, total=16, message="Running `lake clean`"
+                )
+                clean_proc = await _run_proc(
+                    "lake",
+                    "clean",
+                    cwd=lean_project_path_obj,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await _consume_build_output(clean_proc)
+                await clean_proc.wait()
+
+            if fetch_cache:
+                await _safe_report_progress(
+                    ctx, progress=2, total=16, message="Running `lake exe cache get`"
+                )
+                cache_proc = await _run_proc(
+                    "lake",
+                    "exe",
+                    "cache",
+                    "get",
+                    cwd=lean_project_path_obj,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+                await _consume_build_output(cache_proc)
+                await cache_proc.wait()
+
+            # Run build with progress reporting
+            process = await _run_proc(
                 "lake",
-                "clean",
+                "build",
                 cwd=lean_project_path_obj,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
             )
-            await _consume_build_output(clean_proc)
-            await clean_proc.wait()
 
-        if fetch_cache:
-            await _safe_report_progress(
-                ctx, progress=2, total=16, message="Running `lake exe cache get`"
+            await _consume_build_output(process)
+            await process.wait()
+
+            if process.returncode != 0:
+                return BuildResult(
+                    success=False,
+                    output="\n".join(log_lines[-output_lines:]) if output_lines else "",
+                    errors=errors
+                    or [f"Build failed with return code {process.returncode}"],
+                )
+
+            # Start LSP client (without initial build since we just did it)
+            server_command = _effective_server_command(ctx)
+            client = await _start_client(lean_project_path_obj, server_command)
+
+            logger.info("Built project and re-started LSP client")
+            attach_shared_client(lean_project_path_obj, client, server_command)
+            ctx.request_context.lifespan_context.client = client
+
+            return BuildResult(
+                success=True,
+                output="\n".join(log_lines[-output_lines:]) if output_lines else "",
+                errors=[],
             )
-            cache_proc = await _run_proc(
-                "lake",
-                "exe",
-                "cache",
-                "get",
-                cwd=lean_project_path_obj,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            await _consume_build_output(cache_proc)
-            await cache_proc.wait()
 
-        # Run build with progress reporting
-        process = await _run_proc(
-            "lake",
-            "build",
-            cwd=lean_project_path_obj,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-
-        await _consume_build_output(process)
-        await process.wait()
-
-        if process.returncode != 0:
+        except asyncio.CancelledError:
+            if active_proc and active_proc.returncode is None:
+                active_proc.terminate()
+                try:
+                    await asyncio.wait_for(active_proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    active_proc.kill()
+                    await active_proc.wait()
+            raise
+        except Exception as e:
             return BuildResult(
                 success=False,
                 output="\n".join(log_lines[-output_lines:]) if output_lines else "",
-                errors=errors
-                or [f"Build failed with return code {process.returncode}"],
+                errors=[str(e)],
             )
+        finally:
+            if build_flag_set:
+                set_build_in_progress(lean_project_path_obj, False)
 
-        # Start LSP client (without initial build since we just did it)
-        client = AsyncLeanLSPClient(
-            str(lean_project_path_obj),
-            max_workers=config.max_open_files(),
-        )
-        await client.start()
 
-        logger.info("Built project and re-started LSP client")
-        attach_shared_client(lean_project_path_obj, client)
-        ctx.request_context.lifespan_context.client = client
-
-        return BuildResult(
-            success=True,
-            output="\n".join(log_lines[-output_lines:]) if output_lines else "",
-            errors=[],
-        )
-
-    except asyncio.CancelledError:
-        if active_proc and active_proc.returncode is None:
-            active_proc.terminate()
-            try:
-                await asyncio.wait_for(active_proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                active_proc.kill()
-                await active_proc.wait()
-        raise
-    except Exception as e:
-        return BuildResult(
-            success=False,
-            output="\n".join(log_lines[-output_lines:]) if output_lines else "",
-            errors=[str(e)],
-        )
-    finally:
-        if build_flag_set:
-            set_build_in_progress(lean_project_path_obj, False)
+def _diagnostic_position(diagnostic: Dict) -> tuple[int, int]:
+    location = diagnostic.get("fullRange") or diagnostic.get("range")
+    if location is None:
+        return 1, 1
+    return location["start"]["line"] + 1, location["start"]["character"] + 1
 
 
 def _to_diagnostic_messages(diagnostics: Iterable[Dict]) -> List[DiagnosticMessage]:
     """Convert LSP diagnostics to DiagnosticMessage models."""
     result = []
     for diag in diagnostics:
-        r = diag.get("fullRange", diag.get("range"))
-        if r is None:
-            continue
+        line, column = _diagnostic_position(diag)
         severity_int = diag.get("severity", 1)
         result.append(
             DiagnosticMessage(
@@ -792,8 +854,8 @@ def _to_diagnostic_messages(diagnostics: Iterable[Dict]) -> List[DiagnosticMessa
                     severity_int, f"unknown({severity_int})"
                 ),
                 message=diag.get("message", ""),
-                line=r["start"]["line"] + 1,
-                column=r["start"]["character"] + 1,
+                line=line,
+                column=column,
                 lean_tags=_lean_tags(diag),
             )
         )
@@ -819,17 +881,17 @@ def _process_diagnostics(
     failed_deps: List[str] = []
 
     for diag in diagnostics:
-        r = diag.get("fullRange", diag.get("range"))
-        if r is None:
-            continue
-
         severity_int = diag.get("severity", 1)
         message = diag.get("message", "")
-        line = r["start"]["line"] + 1
-        column = r["start"]["character"] + 1
+        line, column = _diagnostic_position(diag)
 
         # Check if this is a build failure at (1,1) - extract dependency paths, skip the item
-        if line == 1 and column == 1 and is_build_stderr(message):
+        if (
+            (diag.get("fullRange") or diag.get("range")) is not None
+            and line == 1
+            and column == 1
+            and is_build_stderr(message)
+        ):
             failed_deps = extract_failed_dependency_paths(message)
             continue  # Don't include the build stderr blob as a diagnostic item
 
@@ -1031,6 +1093,7 @@ def _filter_diagnostics_by_line_range(
     for diagnostic in diagnostics:
         diagnostic_range = diagnostic.get("range") or diagnostic.get("fullRange")
         if not diagnostic_range:
+            matches.append(diagnostic)
             continue
 
         start = diagnostic_range.get("start", {})

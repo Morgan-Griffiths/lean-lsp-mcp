@@ -1,5 +1,6 @@
 import asyncio
-import time
+import os
+import sys
 from pathlib import Path
 
 from leanclient.aio import AsyncLeanLSPClient, ScratchPool
@@ -86,15 +87,26 @@ def get_path_policy(ctx: Context, project_path: Path | None = None) -> LeanPathP
     return build_lean_path_policy(root, _effective_extra_roots(ctx))
 
 
+def _effective_module_root(ctx: Context | None) -> Path | None:
+    if (
+        ctx is None
+        or not ctx.request_context.lifespan_context.external_roots_configured
+    ):
+        return config.module_root()
+    return ctx.request_context.lifespan_context.external_module_root
+
+
 def _effective_extra_roots(ctx: Context | None) -> tuple[Path, ...]:
-    if ctx is None:
-        return ()
+    if (
+        ctx is None
+        or not ctx.request_context.lifespan_context.external_roots_configured
+    ):
+        return config.extra_roots()
     lifespan = ctx.request_context.lifespan_context
     roots: list[Path] = []
-    module_root = getattr(lifespan, "external_module_root", None)
-    if module_root is not None:
-        roots.append(module_root)
-    for root in getattr(lifespan, "external_extra_roots", ()):
+    if lifespan.external_module_root is not None:
+        roots.append(lifespan.external_module_root)
+    for root in lifespan.external_extra_roots:
         if root not in roots:
             roots.append(root)
     return tuple(roots)
@@ -102,12 +114,26 @@ def _effective_extra_roots(ctx: Context | None) -> tuple[Path, ...]:
 
 def _effective_server_command(ctx: Context | None) -> tuple[str, ...]:
     command = ("lake", "serve", "--")
-    if ctx is None:
-        return command
-    module_root = getattr(ctx.request_context.lifespan_context, "external_module_root", None)
-    if module_root is None:
-        return command
-    return (*command, f"--root={module_root}")
+    if module_root := _effective_module_root(ctx):
+        command += (f"--root={module_root}",)
+    for name, value in sorted(config.server_options().items()):
+        formatted = str(value).lower() if isinstance(value, bool) else str(value)
+        command += (f"-D{name}={formatted}",)
+    paths = [str(root) for root in _effective_extra_roots(ctx)]
+    if configured := os.environ.get("LEAN_PATH", ""):
+        paths.append(configured)
+    if paths:
+        # leanclient accepts a command but no subprocess environment. Replace this
+        # child with Lake so process-group cleanup still owns the Lean server.
+        command = (
+            sys.executable,
+            "-c",
+            "import os, sys; os.execvpe(sys.argv[2], sys.argv[2:], "
+            "dict(os.environ, LEAN_PATH=sys.argv[1]))",
+            os.pathsep.join(paths),
+            *command,
+        )
+    return command
 
 
 async def _start_client(
@@ -119,7 +145,15 @@ async def _start_client(
             max_workers=_max_opened_files(),
             server_command=list(server_command),
         )
-        await client.start()
+        try:
+            await client.start()
+        except BaseException:
+            # Until startup succeeds the shared cache cannot own this transport.
+            try:
+                await client.close()
+            except Exception:
+                logger.exception("Failed to close Lean client after startup failed")
+            raise
         logger.info("Shared async LSP client connected at %s", project_path)
     except Exception as exc:
         logger.exception("Failed to start shared Lean LSP client")
@@ -224,13 +258,19 @@ async def detach_shared_client(
     return _shared_clients.pop(project_key, None)
 
 
-def attach_shared_client(project_path: Path | str, client: AsyncLeanLSPClient) -> None:
+def attach_shared_client(
+    project_path: Path | str,
+    client: AsyncLeanLSPClient,
+    server_command: tuple[str, ...] = ("lake", "serve", "--"),
+) -> None:
     project_key = Path(project_path).resolve(strict=False)
     _shared_clients[project_key] = client
-    _shared_client_commands[project_key] = ("lake", "serve", "--")
+    _shared_client_commands[project_key] = server_command
 
 
-def take_shared_clients(project_path: Path | str | None = None) -> list[AsyncLeanLSPClient]:
+def take_shared_clients(
+    project_path: Path | str | None = None,
+) -> list[AsyncLeanLSPClient]:
     """Remove and return cached clients without closing them."""
     if project_path is None:
         clients = list(_shared_clients.values())
@@ -263,7 +303,6 @@ def close_shared_client(project_path: Path | str | None = None) -> None:
 
 async def startup_client(ctx: Context) -> AsyncLeanLSPClient:
     """Ensure the shared async Lean client for the session's project is up."""
-    ctx.request_context.lifespan_context.last_lsp_activity = time.monotonic()
     async with CLIENT_LOCK:
         configured_root = ctx.request_context.lifespan_context.lean_project_path
         if configured_root is None:

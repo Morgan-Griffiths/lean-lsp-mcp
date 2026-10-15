@@ -10,7 +10,13 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from lean_lsp_mcp import server
-from lean_lsp_mcp.client_utils import bind_lean_project_path
+from lean_lsp_mcp.client_utils import (
+    _active_transport,
+    _effective_extra_roots,
+    _effective_module_root,
+    _project_switching_allowed,
+    bind_lean_project_path,
+)
 
 
 def _require_directory(path: str, field_name: str) -> Path:
@@ -47,7 +53,9 @@ def set_project_context(
     ] = None,
     extra_roots: Annotated[
         Optional[list[str]],
-        Field(description="Additional source or generated .olean roots allowed for file tools"),
+        Field(
+            description="Additional source or generated .olean roots for imports and file tools"
+        ),
     ] = None,
 ) -> dict[str, str | list[str] | None]:
     """Bind a Lake project and optional external module roots for later file tools."""
@@ -62,6 +70,19 @@ def set_project_context(
         if resolved != resolved_module_root and resolved not in resolved_extra_roots:
             resolved_extra_roots.append(resolved)
 
+    requested_roots = (
+        (resolved_module_root,) if resolved_module_root is not None else ()
+    ) + tuple(resolved_extra_roots)
+    if not _project_switching_allowed(ctx) and (
+        resolved_module_root != _effective_module_root(ctx)
+        or requested_roots != _effective_extra_roots(ctx)
+    ):
+        raise server.LeanToolError(
+            f"External root switching is disabled for `{_active_transport(ctx)}` "
+            "transport. Configure LEAN_LSP_MODULE_ROOT and LEAN_LSP_EXTRA_ROOTS "
+            "before starting the server."
+        )
+
     try:
         project_root = bind_lean_project_path(ctx, lean_project_path)
     except ValueError as exc:
@@ -70,6 +91,7 @@ def set_project_context(
     lifespan = ctx.request_context.lifespan_context
     lifespan.external_module_root = resolved_module_root
     lifespan.external_extra_roots = tuple(resolved_extra_roots)
+    lifespan.external_roots_configured = True
     return {
         "lean_project_path": str(project_root),
         "module_root": (

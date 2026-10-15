@@ -11,6 +11,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+from pathlib import Path
+
+import orjson
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +22,9 @@ logger = logging.getLogger(__name__)
 ACTIVE_TRANSPORT_ENV = "LEAN_LSP_MCP_ACTIVE_TRANSPORT"
 MAX_OPEN_FILES_ENV = "LEAN_LSP_MAX_OPEN_FILES"
 IDLE_TIMEOUT_SECONDS_ENV = "LEAN_LSP_IDLE_TIMEOUT_SECONDS"
+SERVER_OPTIONS_ENV = "LEAN_LSP_SERVER_OPTIONS"
+MODULE_ROOT_ENV = "LEAN_LSP_MODULE_ROOT"
+EXTRA_ROOTS_ENV = "LEAN_LSP_EXTRA_ROOTS"
 TEST_MODE_ENV = "LEAN_LSP_TEST_MODE"
 PROJECT_PATH_ENV = "LEAN_PROJECT_PATH"
 AUTH_TOKEN_ENV = "LEAN_LSP_MCP_TOKEN"
@@ -122,6 +128,70 @@ def idle_timeout_seconds() -> float | None:
     if value <= 0:
         return None
     return value
+
+
+def server_options() -> dict[str, bool | int | str]:
+    """Client-wide Lean options, passed as individual ``-Dname=value`` arguments."""
+    raw_value = os.environ.get(SERVER_OPTIONS_ENV, "").strip()
+    if not raw_value:
+        return {}
+    try:
+        parsed = orjson.loads(raw_value)
+    except orjson.JSONDecodeError as exc:
+        raise ValueError(f"{SERVER_OPTIONS_ENV} must be a JSON object.") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"{SERVER_OPTIONS_ENV} must be a JSON object.")
+    options: dict[str, bool | int | str] = {}
+    for name, value in parsed.items():
+        if not name or any(character.isspace() for character in name) or "=" in name:
+            raise ValueError(
+                f"{SERVER_OPTIONS_ENV} option names must be non-empty strings "
+                "without whitespace or '='."
+            )
+        if not isinstance(value, (bool, int, str)):
+            raise ValueError(
+                f"{SERVER_OPTIONS_ENV} option '{name}' must have a boolean, "
+                "integer, or string value."
+            )
+        options[name] = value
+    return options
+
+
+def _root_directory(raw_value: str, env_name: str) -> Path:
+    try:
+        root = Path(raw_value).expanduser().resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"{env_name} must name existing directories.") from exc
+    if not root.is_dir():
+        raise ValueError(f"{env_name} must name existing directories.")
+    return root
+
+
+def module_root() -> Path | None:
+    raw_value = os.environ.get(MODULE_ROOT_ENV, "").strip()
+    return _root_directory(raw_value, MODULE_ROOT_ENV) if raw_value else None
+
+
+def extra_roots() -> tuple[Path, ...]:
+    """Configured source/search roots, including the optional module root."""
+    roots = [root] if (root := module_root()) is not None else []
+    raw_value = os.environ.get(EXTRA_ROOTS_ENV, "").strip()
+    if raw_value:
+        try:
+            parsed = orjson.loads(raw_value)
+        except orjson.JSONDecodeError as exc:
+            raise ValueError(
+                f"{EXTRA_ROOTS_ENV} must be a JSON array of paths."
+            ) from exc
+        if not isinstance(parsed, list) or not all(
+            isinstance(value, str) and value.strip() for value in parsed
+        ):
+            raise ValueError(f"{EXTRA_ROOTS_ENV} must be a JSON array of paths.")
+        for value in parsed:
+            root = _root_directory(value, EXTRA_ROOTS_ENV)
+            if root not in roots:
+                roots.append(root)
+    return tuple(roots)
 
 
 # --- Build / logging ---
