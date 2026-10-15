@@ -1,5 +1,7 @@
 """Tests for the centralized config module."""
 
+import json
+
 import pytest
 
 from lean_lsp_mcp import config
@@ -109,3 +111,74 @@ def test_repl_numeric_getters(monkeypatch: pytest.MonkeyPatch):
     assert config.repl_mem_mb() == 8192
     monkeypatch.setenv(config.REPL_TIMEOUT_ENV, "120")
     assert config.repl_timeout() == 120
+
+
+def test_server_options(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv(config.SERVER_OPTIONS_ENV, raising=False)
+    assert config.server_options() == {}
+    monkeypatch.setenv(
+        config.SERVER_OPTIONS_ENV,
+        '{"weak.linter.style.header":false,"maxHeartbeats":400000,"output":"a file"}',
+    )
+    assert config.server_options() == {
+        "weak.linter.style.header": False,
+        "maxHeartbeats": 400000,
+        "output": "a file",
+    }
+
+
+@pytest.mark.parametrize(
+    "value,match",
+    [
+        ("not-json", "must be a JSON object"),
+        ("[]", "must be a JSON object"),
+        ('{"":true}', "option names"),
+        ('{"bad name":true}', "option names"),
+        ('{"bad=name":true}', "option names"),
+        ('{"maxHeartbeats":1.5}', "boolean, integer, or string"),
+        ('{"maxHeartbeats":null}', "boolean, integer, or string"),
+    ],
+)
+def test_server_options_reject_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, value: str, match: str
+):
+    monkeypatch.setenv(config.SERVER_OPTIONS_ENV, value)
+    with pytest.raises(ValueError, match=match):
+        config.server_options()
+
+
+def test_external_roots_are_resolved_and_deduplicated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+):
+    module_root = tmp_path / "theory"
+    extra_root = tmp_path / "generated"
+    module_root.mkdir()
+    extra_root.mkdir()
+    monkeypatch.setenv(config.MODULE_ROOT_ENV, str(module_root))
+    monkeypatch.setenv(
+        config.EXTRA_ROOTS_ENV,
+        json.dumps([str(extra_root), str(module_root), str(extra_root)]),
+    )
+
+    assert config.module_root() == module_root
+    assert config.extra_roots() == (module_root, extra_root)
+
+
+@pytest.mark.parametrize("value", ["not-json", "{}", "[1]", '[""]', '["   "]'])
+def test_extra_roots_reject_invalid_values(monkeypatch: pytest.MonkeyPatch, value: str):
+    monkeypatch.delenv(config.MODULE_ROOT_ENV, raising=False)
+    monkeypatch.setenv(config.EXTRA_ROOTS_ENV, value)
+    with pytest.raises(ValueError, match="JSON array"):
+        config.extra_roots()
+
+
+@pytest.mark.parametrize("kind", ["missing", "file"])
+def test_module_root_must_be_existing_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, kind
+):
+    root = tmp_path / kind
+    if kind == "file":
+        root.write_text("not a directory")
+    monkeypatch.setenv(config.MODULE_ROOT_ENV, str(root))
+    with pytest.raises(ValueError, match="existing directories"):
+        config.module_root()

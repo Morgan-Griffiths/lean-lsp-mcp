@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from lean_lsp_mcp.server import lsp_build
+from lean_lsp_mcp import client_utils, server
 
 
 class _FailingClient:
@@ -76,11 +78,13 @@ def patch_build():
     """Context manager to patch all build dependencies."""
     client_cls = MagicMock()
     client_cls.return_value.start = AsyncMock()
+    client_cls.return_value.close = AsyncMock()
     with (
         patch("lean_lsp_mcp.server.asyncio.create_subprocess_exec") as mock_exec,
-        patch("lean_lsp_mcp.server.AsyncLeanLSPClient", client_cls),
+        patch("lean_lsp_mcp.client_utils.AsyncLeanLSPClient", client_cls),
     ):
         yield mock_exec
+    client_utils.take_shared_clients()
 
 
 @pytest.mark.asyncio
@@ -251,3 +255,121 @@ async def test_lsp_build_continues_when_client_close_fails(
     assert failing_client.close_calls == 1
     assert result.success
     assert ctx.request_context.lifespan_context.client is not failing_client
+
+
+@pytest.mark.asyncio
+async def test_cancelled_request_keeps_shielded_build_active(
+    build_mocks, patch_build, monkeypatch
+):
+    project, ctx, _cache_proc, build_proc = build_mocks
+    coordinator = server.BuildCoordinator("share")
+    context = server.AppContext(
+        lean_project_path=project,
+        client=None,
+        rate_limit={},
+        lean_search_available=False,
+        build_coordinator=coordinator,
+    )
+    ctx.request_context.lifespan_context = context
+    clock = types.SimpleNamespace(now=100.0)
+    monkeypatch.setattr(
+        server, "time", types.SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def read(_size):
+        entered.set()
+        await release.wait()
+        return b""
+
+    build_proc.stdout.read = read
+    patch_build.side_effect = [build_proc]
+    new_client = client_utils.AsyncLeanLSPClient.return_value
+    caller = asyncio.create_task(lsp_build(ctx))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+
+        assert context.active_operations == 1
+        with patch(
+            "lean_lsp_mcp.server.asyncio.sleep",
+            AsyncMock(side_effect=[None, asyncio.CancelledError]),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await server._close_idle_stdio_client(context, 10.0)
+        assert project in client_utils._builds_in_progress
+
+        release.set()
+        assert coordinator._current_task is not None
+        result = await coordinator._current_task
+        assert result.success
+        assert context.active_operations == 0
+        assert context.last_lsp_activity == 100.0
+        clock.now = 110.0
+        with patch(
+            "lean_lsp_mcp.server.asyncio.sleep",
+            AsyncMock(side_effect=[None, asyncio.CancelledError]),
+        ):
+            with pytest.raises(asyncio.CancelledError):
+                await server._close_idle_stdio_client(context, 10.0)
+        new_client.close.assert_awaited_once()
+    finally:
+        caller.cancel()
+        if coordinator._current_task is not None:
+            coordinator._current_task.cancel()
+            await asyncio.gather(coordinator._current_task, return_exceptions=True)
+        await asyncio.gather(caller, return_exceptions=True)
+        client_utils.take_shared_clients()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["build", "restart"])
+async def test_stdio_shutdown_stops_shielded_build(
+    build_mocks, patch_build, monkeypatch, phase
+):
+    project, ctx, _cache_proc, build_proc = build_mocks
+    monkeypatch.setenv("LEAN_PROJECT_PATH", str(project))
+    monkeypatch.setenv("LEAN_BUILD_CONCURRENCY", "share")
+    monkeypatch.delenv("LEAN_MCP_PREWARM_FILES", raising=False)
+    monkeypatch.delenv("LEAN_LSP_MCP_ACTIVE_TRANSPORT", raising=False)
+    monkeypatch.delenv("LEAN_LOOGLE_LOCAL", raising=False)
+    monkeypatch.delenv("LEAN_REPL", raising=False)
+    entered = asyncio.Event()
+
+    async def wait_for_cancellation(*_args):
+        entered.set()
+        await asyncio.Event().wait()
+
+    new_client = client_utils.AsyncLeanLSPClient.return_value
+    if phase == "build":
+        build_proc.returncode = None
+        build_proc.stdout.read = wait_for_cancellation
+    else:
+        build_proc.stdout.read = make_read(b"")
+        new_client.start.side_effect = wait_for_cancellation
+    patch_build.side_effect = [build_proc]
+
+    async with server.app_lifespan(object()) as context:
+        ctx.request_context.lifespan_context = context
+        caller = asyncio.create_task(lsp_build(ctx))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1.0)
+        finally:
+            caller.cancel()
+            await asyncio.gather(caller, return_exceptions=True)
+        assert context.active_operations == 1
+        assert project in client_utils._builds_in_progress
+
+    assert context.active_operations == 0
+    assert project not in client_utils._builds_in_progress
+    assert context.client is None
+    assert client_utils._shared_clients == {}
+    if phase == "build":
+        build_proc.terminate.assert_called_once()
+        build_proc.wait.assert_awaited_once()
+        new_client.start.assert_not_awaited()
+    else:
+        new_client.close.assert_awaited_once()

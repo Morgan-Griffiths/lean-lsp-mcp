@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from mcp.server.fastmcp.exceptions import ToolError
 
 from lean_lsp_mcp import client_utils
 from lean_lsp_mcp import server
@@ -61,7 +62,9 @@ def _clear_optional_runtime_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LEAN_LOOGLE_LOCAL", raising=False)
     monkeypatch.delenv("LEAN_REPL", raising=False)
     monkeypatch.delenv("LEAN_LSP_IDLE_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("LEAN_MCP_PREWARM_FILES", raising=False)
     monkeypatch.delenv("LEAN_LSP_MCP_ACTIVE_TRANSPORT", raising=False)
+    monkeypatch.setattr(server, "_prewarm_started", False)
     client_utils.close_shared_client()
 
 
@@ -210,6 +213,162 @@ async def test_idle_stdio_client_closes_shared_client(tmp_path: Path) -> None:
         with pytest.raises(asyncio.CancelledError):
             await task
         client_utils._shared_clients.clear()
+
+
+async def _poll_idle_once(
+    monkeypatch: pytest.MonkeyPatch, context: server.AppContext, timeout: float
+) -> None:
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            server.asyncio,
+            "sleep",
+            AsyncMock(side_effect=[None, asyncio.CancelledError]),
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await server._close_idle_stdio_client(context, timeout)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["success", "error", "cancel"])
+async def test_idle_waits_for_tool_completion(
+    monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    clock = types.SimpleNamespace(now=100.0)
+    monkeypatch.setattr(
+        server, "time", types.SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    ctx = _make_ctx()
+    context = ctx.request_context.lifespan_context
+    client = DummyClient()
+    context.client = client
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    mcp = server.LeanMCP(name="test")
+    monkeypatch.setattr(mcp, "get_context", lambda: ctx)
+
+    @mcp.tool()
+    async def long_tool() -> str:
+        entered.set()
+        await release.wait()
+        if outcome == "error":
+            raise ValueError("tool failed")
+        return "done"
+
+    task = asyncio.create_task(mcp.call_tool("long_tool", {}))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        assert context.active_operations == 1
+        await _poll_idle_once(monkeypatch, context, 10.0)
+        assert client.closed_calls == 0
+
+        if outcome == "cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            release.set()
+            if outcome == "error":
+                with pytest.raises(ToolError, match="tool failed"):
+                    await task
+            else:
+                await task
+
+        assert context.active_operations == 0
+        assert context.last_lsp_activity == 100.0
+        clock.now = 109.0
+        await _poll_idle_once(monkeypatch, context, 10.0)
+        assert client.closed_calls == 0
+        clock.now = 110.0
+        await _poll_idle_once(monkeypatch, context, 10.0)
+        assert client.closed_calls == 1
+        assert context.client is None
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_prewarm_is_protected_then_closes_without_a_tool_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project_dir = _make_project(tmp_path / "proj")
+    context = _make_ctx(lean_project_path=project_dir).request_context.lifespan_context
+    client = DummyClient()
+    client.open = AsyncMock()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def barrier(_path: str) -> None:
+        entered.set()
+        await release.wait()
+
+    client.barrier = barrier
+
+    async def get_client(_path: Path) -> DummyClient:
+        client_utils._shared_clients[project_dir] = client
+        return client
+
+    monkeypatch.setattr(server, "_get_or_create_shared_client", get_client)
+    clock = types.SimpleNamespace(now=100.0)
+    monkeypatch.setattr(
+        server, "time", types.SimpleNamespace(monotonic=lambda: clock.now)
+    )
+    task = asyncio.create_task(server._prewarm_project_files(context, ["A.lean"]))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        assert context.client is None
+        assert context.active_operations == 1
+        await _poll_idle_once(monkeypatch, context, 10.0)
+        assert client.closed_calls == 0
+        release.set()
+        await task
+
+        assert context.active_operations == 0
+        clock.now = 110.0
+        await _poll_idle_once(monkeypatch, context, 10.0)
+        assert client.closed_calls == 1
+        assert client_utils._shared_clients == {}
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        client_utils._shared_clients.clear()
+
+
+@pytest.mark.asyncio
+async def test_stdio_shutdown_cancels_prewarm_before_closing_client(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project_dir = _make_project(tmp_path / "proj")
+    monkeypatch.setenv("LEAN_PROJECT_PATH", str(project_dir))
+    monkeypatch.setenv("LEAN_MCP_PREWARM_FILES", "A.lean")
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    client = DummyClient()
+    client.open = AsyncMock()
+
+    async def barrier(_path: str) -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            assert client.closed_calls == 0
+            cancelled.set()
+
+    client.barrier = barrier
+
+    async def get_client(_path: Path) -> DummyClient:
+        client_utils._shared_clients[project_dir] = client
+        return client
+
+    monkeypatch.setattr(server, "_get_or_create_shared_client", get_client)
+    async with server.app_lifespan(object()) as context:
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        assert context.active_operations == 1
+
+    assert cancelled.is_set()
+    assert context.active_operations == 0
+    assert client.closed_calls == 1
+    assert client_utils._shared_clients == {}
 
 
 def test_close_shared_client_closes_client() -> None:
